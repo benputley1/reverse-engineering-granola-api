@@ -43,7 +43,6 @@ Granola uses WorkOS for authentication with refresh token rotation.
 - `filter_by_workspace.py` - Filter and organize documents by workspace
 - `filter_by_folder.py` - Filter and organize documents by folder
 - `GETTING_REFRESH_TOKEN.md` - Method to extract tokens from Granola app
-- `cloudflare-worker/` - Cloudflare Worker for automated syncing to n8n webhooks
 
 ## API Endpoints
 
