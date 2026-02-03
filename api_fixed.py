@@ -1,13 +1,12 @@
 """
 FastAPI wrapper for Granola API with persistent token rotation.
-Uses volume-based file storage to persist tokens across restarts.
+Auto-updates Railway env var when WorkOS rotates the refresh token.
 """
 import os
 import json
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, List
-from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import requests
@@ -18,7 +17,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Granola API",
     description="Reverse-engineered Granola API with persistent token rotation",
-    version="1.2.0"
+    version="1.1.0"
 )
 
 app.add_middleware(
@@ -29,9 +28,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Persistent token state file (on Railway volume)
-TOKEN_STATE_FILE = Path("/data/token_state.json")
-
 class TokenState:
     def __init__(self):
         self.access_token: Optional[str] = None
@@ -39,48 +35,10 @@ class TokenState:
         self.client_id: str = os.environ.get("GRANOLA_CLIENT_ID", "")
         self.token_expiry: Optional[datetime] = None
         
-        # Try to load persisted state (may have newer refresh token than env var)
-        self._load_persisted_state()
-    
-    def _load_persisted_state(self):
-        """Load token state from persistent storage."""
-        try:
-            if TOKEN_STATE_FILE.exists():
-                with open(TOKEN_STATE_FILE, 'r') as f:
-                    state = json.load(f)
-                
-                persisted_refresh = state.get("refresh_token")
-                if persisted_refresh:
-                    # Use persisted token if it exists (it's more recent than env var)
-                    self.refresh_token = persisted_refresh
-                    logger.info(f"Loaded persisted refresh token: {persisted_refresh[:10]}...")
-                
-                # Also restore access token if still valid
-                expiry_str = state.get("token_expiry")
-                if expiry_str:
-                    expiry = datetime.fromisoformat(expiry_str)
-                    if datetime.now() < expiry - timedelta(minutes=5):
-                        self.access_token = state.get("access_token")
-                        self.token_expiry = expiry
-                        logger.info("Restored valid access token from persistence")
-        except Exception as e:
-            logger.warning(f"Could not load persisted state: {e}")
-    
-    def _persist_state(self):
-        """Save token state to persistent storage."""
-        try:
-            TOKEN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            state = {
-                "refresh_token": self.refresh_token,
-                "access_token": self.access_token,
-                "token_expiry": self.token_expiry.isoformat() if self.token_expiry else None,
-                "updated_at": datetime.now().isoformat()
-            }
-            with open(TOKEN_STATE_FILE, 'w') as f:
-                json.dump(state, f, indent=2)
-            logger.info("Persisted token state to volume")
-        except Exception as e:
-            logger.error(f"Failed to persist token state: {e}")
+        # Railway API for persisting rotated tokens
+        self.railway_token = os.environ.get("RAILWAY_API_TOKEN", "")
+        self.railway_env_id = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
+        self.railway_service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
     
     def is_expired(self) -> bool:
         if not self.access_token or not self.token_expiry:
@@ -88,16 +46,57 @@ class TokenState:
         buffer = timedelta(minutes=5)
         return datetime.now() >= (self.token_expiry - buffer)
     
-    def refresh(self) -> bool:
-        """Exchange refresh token for new access token via WorkOS."""
-        if not self.refresh_token:
-            logger.error("No refresh token available")
-            return False
-        if not self.client_id:
-            logger.error("No client_id found")
+    def _persist_refresh_token(self, new_token: str) -> bool:
+        """Update Railway env var with the new rotated refresh token."""
+        if not all([self.railway_token, self.railway_env_id, self.railway_service_id]):
+            logger.warning("Railway API credentials not configured - token won't persist across restarts")
             return False
         
-        logger.info(f"Attempting token refresh with: {self.refresh_token[:10]}...")
+        try:
+            # Railway GraphQL API to update service variable
+            url = "https://backboard.railway.app/graphql/v2"
+            headers = {
+                "Authorization": f"Bearer {self.railway_token}",
+                "Content-Type": "application/json"
+            }
+            
+            mutation = """
+            mutation($input: VariableUpsertInput!) {
+                variableUpsert(input: $input)
+            }
+            """
+            
+            variables = {
+                "input": {
+                    "environmentId": self.railway_env_id,
+                    "serviceId": self.railway_service_id,
+                    "name": "GRANOLA_REFRESH_TOKEN",
+                    "value": new_token
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json={
+                "query": mutation,
+                "variables": variables
+            })
+            response.raise_for_status()
+            
+            result = response.json()
+            if result.get("errors"):
+                logger.error(f"Railway API error: {result['errors']}")
+                return False
+            
+            logger.info("Successfully persisted new refresh token to Railway env")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to persist token to Railway: {e}")
+            return False
+    
+    def refresh(self) -> bool:
+        """Exchange refresh token for new access token via WorkOS."""
+        if not self.refresh_token or not self.client_id:
+            logger.error("Missing GRANOLA_REFRESH_TOKEN or GRANOLA_CLIENT_ID env vars")
+            return False
         
         url = "https://api.workos.com/user_management/authenticate"
         data = {
@@ -120,12 +119,12 @@ class TokenState:
                 new_prefix = new_refresh[:10]
                 logger.info(f"Refresh token rotated: {old_prefix}... -> {new_prefix}...")
                 self.refresh_token = new_refresh
+                
+                # CRITICAL: Persist to Railway so it survives restarts
+                self._persist_refresh_token(new_refresh)
             
             expires_in = result.get("expires_in", 3600)
             self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
-            
-            # CRITICAL: Persist the new state to survive restarts
-            self._persist_state()
             
             logger.info(f"Token refreshed, expires in {expires_in}s")
             return True
@@ -160,36 +159,17 @@ def get_headers() -> dict:
 # Endpoints
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "granola-api", "version": "1.2.0"}
+    return {"status": "ok", "service": "granola-api", "version": "1.1.0"}
 
 @app.get("/health")
 async def health():
     token = token_state.get_token()
-    persisted = TOKEN_STATE_FILE.exists()
     return {
         "status": "healthy" if token else "unhealthy",
         "token_valid": token is not None,
         "token_expiry": token_state.token_expiry.isoformat() if token_state.token_expiry else None,
-        "persistence_enabled": persisted,
-        "refresh_token_prefix": token_state.refresh_token[:10] + "..." if token_state.refresh_token else None
+        "railway_persistence": bool(token_state.railway_token)
     }
-
-@app.post("/reset-token")
-async def reset_token():
-    """Reset token state and reload from environment variable."""
-    global token_state
-    # Delete persisted state
-    if TOKEN_STATE_FILE.exists():
-        TOKEN_STATE_FILE.unlink()
-        logger.info("Deleted persisted token state")
-    # Reinitialize from env var
-    token_state = TokenState()
-    # Force a refresh to get new token
-    try:
-        token_state._refresh_token()
-        return {"status": "ok", "message": "Token reset and refreshed", "refresh_token_prefix": token_state.refresh_token[:10] + "..."}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
 
 @app.get("/documents")
 async def list_documents(
@@ -372,7 +352,7 @@ async def search_documents(
     url = "https://api.granola.ai/v2/get-documents"
     
     data = {
-        "limit": 100,
+        "limit": 100,  # Fetch more to filter
         "offset": 0,
         "include_last_viewed_panel": True
     }
