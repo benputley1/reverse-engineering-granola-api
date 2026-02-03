@@ -186,7 +186,7 @@ async def reset_token():
     token_state = TokenState()
     # Force a refresh to get new token
     try:
-        token_state._refresh_token()
+        token_state.refresh()
         return {"status": "ok", "message": "Token reset and refreshed", "refresh_token_prefix": token_state.refresh_token[:10] + "..."}
     except Exception as e:
         return {"status": "error", "message": str(e)}
